@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flutter web GPU memory tests (flutter/flutter#194283)</title>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 24px; max-width: 980px; }
+  table { border-collapse: collapse; margin: 8px 0; } td, th { border: 1px solid #ccc; padding: 3px 8px; text-align: left; vertical-align: top; }
+  button { font-size: 16px; padding: 6px 16px; margin-right: 8px; }
+  textarea { width: 100%; height: 240px; font: 12px/1.3 monospace; }
+  .pass { color: #070; font-weight: bold; } .fail { color: #b00; font-weight: bold; } .muted { color: #666; }
+  #status { font-size: 18px; margin: 12px 0; }
+</style>
+</head>
+<body>
+<h2>Flutter web GPU memory tests</h2>
+<p>For <a href="https://github.com/flutter/flutter/issues/194283">flutter/flutter#194283</a>.
+   Click <b>Run all tests</b> on the affected Chromebook, then leave the tab alone until the results appear
+   (about 6–10 minutes). The page moves from test to test on its own.</p>
+<p><b>Some tests are expected to black out the screen for a moment.</b> That's the result we're looking for:
+   the page notices, records it, and continues with the next test.
+   If the page itself ever disappears, reopen this page and click <b>Resume</b>.</p>
+<div id="status"></div>
+<div id="controls"></div>
+<div id="results"></div>
+<script>
+'use strict';
+const STATE_KEY = 'gpuProbeRunner';
+const HERE = location.origin + location.pathname;
+const COLLECT = new URLSearchParams(location.search).get('collect') === '1';  // local testing only
+// Local testing only: simulateLoss=<step,step> forces a WebGL context loss in those steps.
+const SIMULATE = (new URLSearchParams(location.search).get('simulateLoss') || localStorage.getItem('gpuProbeSimulate') || '').split(',');
+if (new URLSearchParams(location.search).has('simulateLoss')) localStorage.setItem('gpuProbeSimulate', SIMULATE.join(','));
+const RETURN = HERE + '?continue=1' + (COLLECT ? '&collect=1' : '');
+
+// Most informative and least risky first. 'then' adds follow-up steps based on a result.
+const STEPS = {
+  app_asset_low:    {kind: 'app', q: 'source=asset&quality=low', what: 'Control: pre-made image, no mipmaps, no Picture.toImage'},
+  app_shrink:       {kind: 'app', q: 'quality=medium&shrinkToImage=1', what: 'Mipmaps on, idle Picture.toImage canvas freed (~114 MiB peak)'},
+  app_low6:         {kind: 'app', q: 'quality=low&layers=6', what: 'No mipmaps, 6 stacked images (~278 MiB)'},
+  app_asset_medium: {kind: 'app', q: 'source=asset&quality=medium', what: 'Mipmaps on, pre-made image, no Picture.toImage (~81 MiB peak)'},
+  probe_env_all_nomip: {kind: 'probe', case: 'env_all_nomip', what: 'WebGL only: Flutter-like setup, no mipmapped copy (3.41-like)'},
+  probe_bytes_hi:   {kind: 'probe', case: 'bytes_hi', what: 'WebGL only: plain page, no mips, ~210 MiB'},
+  probe_flutter_hi: {kind: 'probe', case: 'flutter_hi', what: 'WebGL only: plain page, mipmapped copy on top of ~150 MiB'},
+  probe_env_all:    {kind: 'probe', case: 'env_all', what: 'WebGL only: Flutter-like setup + mipmapped copy (~166 MiB)',
+                     then: (r) => isFail(r) ? ['probe_env_toimg', 'probe_env_present', 'probe_env_fps1', 'probe_env_all_nocopy']
+                                            : ['probe_env_all_bytes']},
+  probe_env_toimg:  {kind: 'probe', case: 'env_toimg', what: 'WebGL only: mipmapped copy + idle 3840x1980 context'},
+  probe_env_present:{kind: 'probe', case: 'env_present', what: 'WebGL only: mipmapped copy + OffscreenCanvas presentation'},
+  probe_env_fps1:   {kind: 'probe', case: 'env_fps1', what: 'WebGL only: mipmapped copy at 1 frame per second'},
+  probe_env_all_nocopy: {kind: 'probe', case: 'env_all_nocopy', what: 'WebGL only: Flutter-like setup, 12-level allocation without the copy'},
+  probe_env_all_bytes:  {kind: 'probe', case: 'env_all_bytes', what: 'WebGL only: Flutter-like setup, no mips, ~214 MiB'},
+  app_medium:       {kind: 'app', q: 'quality=medium', what: 'Original scenario (expected to black out, like 3.47.5)'},
+};
+const ORDER = ['app_asset_low', 'app_shrink', 'app_low6', 'app_asset_medium',
+               'probe_env_all_nomip', 'probe_bytes_hi', 'probe_flutter_hi', 'probe_env_all', 'app_medium'];
+
+const isFail = (r) => !!r && /CONTEXT LOST|INTERRUPTED/.test(r.result || '');
+const load = () => { try { return JSON.parse(localStorage.getItem(STATE_KEY) || 'null'); } catch (e) { return null; } };
+const save = (s) => localStorage.setItem(STATE_KEY, JSON.stringify(s));
+const el = (id) => document.getElementById(id);
+
+function deviceInfo() {
+  const info = {userAgent: navigator.userAgent, deviceMemoryGB: navigator.deviceMemory ?? null,
+                screen: `${screen.width}x${screen.height}@${devicePixelRatio}`, viewport: `${innerWidth}x${innerHeight}`};
+  const gl = document.createElement('canvas').getContext('webgl2');
+  if (!gl) { info.webgl2 = false; return info; }
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  info.unmaskedRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  info.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  gl.getExtension('WEBGL_lose_context')?.loseContext();
+  return info;
+}
+
+function stepUrl(id) {
+  const s = STEPS[id];
+  const ret = encodeURIComponent(RETURN);
+  const sim = SIMULATE.includes(id) ? '&debugLoseContext=1' : '';
+  return s.kind === 'app'
+      ? `app/?${s.q}&auto=1${sim}&return=${ret}`
+      : `ballast_probe.html?case=${s.case}&auto=1${sim}&return=${ret}${COLLECT ? '&collect=1' : ''}`;
+}
+
+// The record the step page wrote to its own localStorage key.
+function readStepRecord(id, since) {
+  const key = STEPS[id].kind === 'app' ? 'probeAppRuns' : 'mipProbeRuns';
+  let runs = [];
+  try { runs = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) {}
+  const r = runs.filter((x) => x.startedAt >= since).pop();
+  if (!r) return {result: 'NO RECORD', events: []};
+  return {result: r.result || 'INTERRUPTED (no result recorded: the page or GPU process died)', events: r.events};
+}
+
+function start() {
+  const state = {startedAt: new Date().toISOString(), device: deviceInfo(), queue: ORDER.slice(), index: 0,
+                 results: {}, current: null};
+  save(state);
+  go(state);
+}
+
+function go(state) {
+  const id = state.queue[state.index];
+  state.current = {id, startedAt: new Date().toISOString()};
+  save(state);
+  location.href = stepUrl(id);
+}
+
+function advance(state) {
+  const id = state.current.id;
+  const rec = readStepRecord(id, state.current.startedAt);
+  state.results[id] = rec;
+  state.current = null;
+  if (/^NO WEBGL/.test(rec.result)) {
+    save(state);
+    render(state, `Chrome turned off WebGL for this page (probably after a GPU reset). Close this tab, ` +
+                  `open the page again, and click Resume to retry "${id}".`);
+    return;
+  }
+  const extra = STEPS[id].then ? STEPS[id].then(rec) : [];
+  state.queue.splice(state.index + 1, 0, ...extra.filter((x) => !state.queue.includes(x)));
+  state.index++;
+  save(state);
+  if (state.index >= state.queue.length) { finishAll(state); return; }
+  // Give the GPU process a moment to settle (it may just have restarted).
+  let n = 5;
+  const tick = () => {
+    el('status').textContent = `Test ${state.index}/${state.queue.length} done (${id}: ${rec.result}). Next test in ${n} s…`;
+    if (n-- <= 0) go(state); else setTimeout(tick, 1000);
+  };
+  render(state);
+  tick();
+}
+
+function finishAll(state) {
+  state.finishedAt = new Date().toISOString();
+  save(state);
+  render(state);
+  if (COLLECT) fetch('/log?run=runner', {method: 'POST', body: JSON.stringify(resultsJson(state)), keepalive: true});
+}
+
+function resultsJson(state) {
+  return {
+    device: state.device, startedAt: state.startedAt, finishedAt: state.finishedAt || null,
+    results: state.queue.filter((id) => state.results[id]).map((id) => ({
+      test: id, what: STEPS[id].what, result: state.results[id].result,
+      ledger: state.results[id].events.filter((e) => /ledger|mipmapped allocation|context lost|shrinking|RESULT/i.test(e)),
+      events: state.results[id].events,
+    })),
+  };
+}
+
+function render(state, message) {
+  const done = state && state.finishedAt;
+  el('status').textContent = message || (done ? 'All tests finished. Please copy the results below into the issue.'
+      : state ? `Test ${state.index + 1} of ${state.queue.length}` : '');
+  const controls = [];
+  if (!state || done) controls.push('<button id="run">Run all tests</button>');
+  if (state && !done) controls.push('<button id="resume">Resume</button>', '<button id="skip">Skip this test</button>');
+  if (state) controls.push('<button id="reset">Start over</button>');
+  el('controls').innerHTML = controls.join('');
+  el('run')?.addEventListener('click', start);
+  el('resume')?.addEventListener('click', () => go(load()));
+  el('skip')?.addEventListener('click', () => {
+    const s = load(); const id = s.queue[s.index];
+    s.results[id] = {result: 'SKIPPED', events: []}; s.index++; save(s);
+    if (s.index >= s.queue.length) finishAll(s); else go(s);
+  });
+  el('reset')?.addEventListener('click', () => {
+    localStorage.removeItem(STATE_KEY); localStorage.removeItem('gpuProbeSimulate'); location.replace(HERE);
+  });
+  if (!state) { el('results').innerHTML = ''; return; }
+  const rows = state.queue.map((id, i) => {
+    const r = state.results[id];
+    const cls = !r ? 'muted' : isFail(r) ? 'fail' : r.result === 'PASS' ? 'pass' : '';
+    const peak = r ? (r.events.filter((e) => /ledger (peak|frame \d peak)/.test(e)).pop() || '').replace(/^[\d.]+s /, '') : '';
+    return `<tr><td>${i + 1}</td><td>${id}</td><td>${STEPS[id].what}</td>` +
+           `<td class="${cls}">${r ? r.result : (i === state.index && !done ? 'next' : '')}</td><td class="muted">${peak}</td></tr>`;
+  }).join('');
+  el('results').innerHTML =
+      `<table><tr><th>#</th><th>test</th><th>what it checks</th><th>result</th><th>GPU memory</th></tr>${rows}</table>` +
+      (done ? `<h3>Results to paste into the issue</h3>
+               <p><button id="copy">Copy results</button><span id="copied" class="muted"></span></p>
+               <textarea readonly id="json"></textarea>` : '');
+  if (done) {
+    el('json').value = '```json\n' + JSON.stringify(resultsJson(state), null, 1) + '\n```';
+    el('copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(el('json').value); el('copied').textContent = ' copied'; }
+      catch (e) { el('json').select(); document.execCommand('copy'); el('copied').textContent = ' copied'; }
+    });
+  }
+}
+
+const state = load();
+if (new URLSearchParams(location.search).get('continue') === '1' && state && state.current) {
+  history.replaceState(null, '', HERE + (COLLECT ? '?collect=1' : ''));
+  advance(state);
+} else if (state && state.current) {
+  // Came back without a result, e.g. the page died during the test.
+  const rec = readStepRecord(state.current.id, state.current.startedAt);
+  state.results[state.current.id] = rec;
+  state.current = null;
+  if (isFail(rec) || rec.result === 'NO RECORD') state.index++;
+  save(state);
+  if (state.index >= state.queue.length) finishAll(state);
+  else render(state, `The last test (${state.queue[state.index - 1]}) ended with: ${rec.result}. Click Resume to continue.`);
+} else {
+  render(state);
+  if (!state && new URLSearchParams(location.search).get('autostart') === '1') start();  // local testing only
+}
+</script>
+</body>
+</html>

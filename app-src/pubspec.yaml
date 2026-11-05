@@ -1,0 +1,16 @@
+name: flutter_web_gpu_probe
+description: "Measures CanvasKit GPU memory and context loss for large downscaled images (flutter/flutter#194283)."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/background.png

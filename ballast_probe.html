@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGL2 mipmapped-copy ballast probe (flutter/flutter#194283)</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: -1; }
+  #panel { background: rgba(255,255,255,.92); padding: 12px; max-width: 980px; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: 2px 6px; text-align: left; }
+  pre, textarea { font: 12px/1.3 monospace; } textarea { width: 100%; height: 220px; }
+  .pass { color: #070; font-weight: bold; } .fail { color: #b00; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="panel"></div>
+<!-- Optional: GPU memory ledger (gpu_ledger.js next to this file). The probe works without it. -->
+<script src="gpu_ledger.js"></script>
+<script>
+'use strict';
+// "Ballast" extension of mip_probe.html: the same GL sequence, plus switches
+// that rebuild Flutter web's environment around it one piece at a time:
+//   toimg=N     an idle 3840x1980 OffscreenCanvas WebGL2 context with CanvasKit's
+//               attributes (depth + stencil), created first, with N
+//               clear+readPixels rounds (Picture.toImage + readback per background)
+//   present=offscreen  render into an OffscreenCanvas and present every frame via
+//               createImageBitmap -> bitmaprenderer (Flutter's OffscreenCanvasRasterizer)
+//   ds=1        depth + stencil on the main context (CanvasKit's defaults)
+//   heap=MiB    a committed WebAssembly.Memory of that size (CanvasKit's wasm heap)
+//   bitmaps=N   N extra live 3840x1980 ImageBitmaps (decoded image sources)
+//   fps=1       draw once per second, like the repro app's 1 Hz panel refresh
+//   delbase=1   delete the base texture after the copy (as Ganesh does)
+//   fin=1       gl.finish() + getError right after the copy
+if (new URLSearchParams(location.search).get('collect') === '1') {
+  window.__gpuLedgerSink = (obj) => {
+    try { fetch('/log?run=' + encodeURIComponent(new URLSearchParams(location.search).get('run') || 'probe'),
+                {method: 'POST', body: JSON.stringify(obj), keepalive: true}); } catch (e) {}
+  };
+}
+// Standalone (no Flutter, no Skia) reproduction of the GL sequence that
+// CanvasKit/Ganesh issues when a large image is first drawn downscaled with
+// FilterQuality.medium in Flutter 3.47:
+//   frame 0: texImage2D(level 0, RGBA, ImageBitmap)  -> draw (no mips)
+//   frame 1: texStorage2D(levels, RGBA8) on a new texture,
+//            copyTexSubImage2D(level 0) from an FBO wrapping the frame-0 texture,
+//            generateMipmap, draw with LINEAR_MIPMAP_LINEAR.
+// One case per page load. Every step is logged to localStorage, so the log
+// survives a GPU process restart. The page never restores a lost context, so a
+// failing case blacks out the screen once instead of looping.
+
+const SRC_W = 3840, SRC_H = 1980;
+// Set by the test runner (index.html): run one case, then return to RETURN_URL.
+const AUTO = new URLSearchParams(location.search).get('auto') === '1';
+const RETURN_URL = new URLSearchParams(location.search).get('return') || './?continue=1';
+const RUN_SECONDS = 10;
+const STORAGE_KEY = 'mipProbeRuns';
+
+// name: [description, params]
+const CASES = {
+  control:  ['3.41-like baseline: base texture only, no mipmapped copy', {levels: 0}],
+  single:   ['texStorage2D 1 level 3840x1980 + copy (same calls, no mip chain)', {w: 3840, h: 1980, levels: 1, copy: 1, gen: 0}],
+  nocopy:   ['texStorage2D 12 levels 3840x1980, no copy, no generateMipmap', {w: 3840, h: 1980, levels: 12, copy: 0, gen: 0}],
+  nogen:    ['texStorage2D 12 levels 3840x1980 + copy, no generateMipmap (Variant A)', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 0}],
+  flutter:  ['Exact Flutter 3.47 sequence: 12 levels + copy + generateMipmap', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1}],
+  quarter:  ['Quarter-area copy: 11 levels 1920x990 + copy + generateMipmap', {w: 1920, h: 990, levels: 11, copy: 1, gen: 1}],
+  pot:      ['Power-of-two: 13 levels 4096x2048 + copy + generateMipmap', {w: 4096, h: 2048, levels: 13, copy: 1, gen: 1}],
+  bytes:    ['No mips, more bytes: 3 extra 3840x1980 texImage2D textures', {levels: 0, extra: 3}],
+  // --- Flutter-environment ("ballast") cases. ENV mirrors the measured Flutter
+  // repro: idle toImage context (6 renders + readbacks), offscreen presentation
+  // with depth/stencil, wasm heap, one live decoded ImageBitmap, 1 Hz frames,
+  // base texture deleted after the copy.
+  env_toimg:     ['flutter + idle 3840x1980 toImage context', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, toimg: 6}],
+  env_present:   ['flutter + OffscreenCanvas/createImageBitmap presentation + depth/stencil', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, present: 'offscreen', ds: 1}],
+  env_fps1:      ['flutter at 1 Hz, base deleted after copy', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1}],
+  env_all:       ['flutter inside the full Flutter-like environment', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, ENV: 1}],
+  env_all_nomip: ['control (no mipmapped copy) inside the full environment (3.41-like)', {levels: 0, ENV: 1}],
+  env_all_nocopy:['12-level allocation, no copy, no generateMipmap, full environment', {w: 3840, h: 1980, levels: 12, copy: 0, gen: 0, ENV: 1}],
+  env_all_bytes: ['no mips, 3 extra base textures, full environment', {levels: 0, extra: 3, ENV: 1}],
+  // Plain page (no environment), but with more live bytes than Flutter's
+  // measured peak (~172 MiB at the mipmapped copy, ~133 MiB with mips off).
+  bytes_hi:      ['plain page, no mips, 6 extra 3840x1980 textures (~203 MiB + canvas)', {levels: 0, extra: 6}],
+  flutter_hi:    ['plain page, Flutter sequence on top of 4 extra textures (~184 MiB + canvas)', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, extra: 4}],
+};
+const ENV = {toimg: 6, present: 'offscreen', ds: 1, heap: 64, bitmaps: 0, fps: 1, delbase: 1};
+
+function params() {
+  const q = new URLSearchParams(location.search);
+  const name = q.get('case');
+  if (!name) return null;
+  let base = CASES[name] ? {...CASES[name][1]} : {};
+  if (base.ENV) { delete base.ENV; base = {...ENV, ...base}; }
+  for (const k of ['w', 'h', 'levels', 'copy', 'gen', 'extra', 'sync', 'toimg', 'ds', 'heap', 'bitmaps', 'fps', 'delbase', 'fin']) {
+    if (q.has(k)) base[k] = Number(q.get(k));
+  }
+  if (q.has('present')) base.present = q.get('present');
+  return {name, sync: 1, extra: 0, copy: 0, gen: 0, toimg: 0, present: 'canvas', ds: 0, heap: 0,
+          bitmaps: 0, fps: 60, delbase: 0, fin: 0, ...base};
+}
+
+function mib(bytes) { return (bytes / 1048576).toFixed(1) + ' MiB'; }
+function chainBytes(w, h, levels) {
+  let t = 0;
+  for (let i = 0; i < levels; i++) t += Math.max(1, w >> i) * Math.max(1, h >> i) * 4;
+  return t;
+}
+function estimateBytes(p) {
+  const base = SRC_W * SRC_H * 4;
+  if (p.ENV) { p = {...ENV, ...p}; }
+  let b = base * (1 + (p.extra || 0)) + (p.levels ? chainBytes(p.w, p.h, p.levels) : 0);
+  // Idle toImage context: color + depth/stencil drawing buffer + the 29 MiB
+  // snapshot texture Ganesh keeps cached (measured in the Flutter repro).
+  if (p.toimg) b += base * 2 + base;
+  return b;
+}
+
+function loadRuns() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch (e) { return []; } }
+function saveRuns(runs) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(runs.slice(-30))); } catch (e) {} }
+
+function deviceInfo() {
+  const c = document.createElement('canvas');
+  const gl = c.getContext('webgl2');
+  const info = {userAgent: navigator.userAgent, deviceMemoryGB: navigator.deviceMemory ?? null};
+  if (!gl) { info.webgl2 = false; return info; }
+  info.renderer = gl.getParameter(gl.RENDERER);
+  info.vendor = gl.getParameter(gl.VENDOR);
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  info.debugRendererInfoAvailable = !!dbg;
+  if (dbg) {
+    info.unmaskedRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+    info.unmaskedVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+  }
+  info.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  gl.getExtension('WEBGL_lose_context')?.loseContext();
+  return info;
+}
+
+// ---------------------------------------------------------------- index page
+function renderIndex() {
+  const runs = loadRuns();
+  const info = deviceInfo();
+  const rows = Object.entries(CASES).map(([name, [desc, p]]) => {
+    const full = {extra: 0, ...p};
+    return `<tr><td><a href="?case=${name}">${name}</a></td><td>${desc}</td><td>${mib(estimateBytes(full))}</td></tr>`;
+  }).join('') + `<tr><td><a href="?case=flutter&sync=0">flutter&amp;sync=0</a></td>` +
+      `<td>Exact Flutter sequence without this page's glGetError sync points (Skia skips them on WebGL)</td>` +
+      `<td>${mib(estimateBytes({extra: 0, w: 3840, h: 1980, levels: 12}))}</td></tr>`;
+  const history = runs.map(r => {
+    const verdict = r.result === 'PASS' ? '<span class="pass">PASS</span>'
+        : r.result === 'CONTEXT LOST' ? '<span class="fail">CONTEXT LOST</span>'
+        : `<span class="fail">${r.result || 'INTERRUPTED (no result recorded: page/GPU process died)'}</span>`;
+    return `<tr><td>${r.startedAt}</td><td>${r.case}</td><td>${verdict}</td></tr>`;
+  }).reverse().join('');
+  document.getElementById('panel').innerHTML = `
+    <h2>WebGL2 mipmapped-copy ballast probe</h2>
+    <p>Open one case at a time, wait ${RUN_SECONDS}s (or for the blackout), then come back to this page
+       (<code>${location.pathname.split('/').pop() || 'this page'}</code> without <code>?case=</code>).
+       Suggested order: env_all_nomip, bytes_hi, flutter_hi, env_all, env_toimg, env_present, env_fps1, env_all_nocopy, env_all_bytes.
+       A case that blacks out the screen won't record a result; that is the answer for that case.</p>
+    <table><tr><th>case</th><th>what it does</th><th>est. live texture bytes</th></tr>${rows}</table>
+    <h3>Run history (newest first)</h3>
+    <table><tr><th>started</th><th>case</th><th>result</th></tr>${history || '<tr><td colspan=3>none yet</td></tr>'}</table>
+    <h3>Results to paste into the issue</h3>
+    <textarea readonly>${JSON.stringify({device: info, runs}, null, 1).replace(/</g, '&lt;')}</textarea>
+    <p><button id="clear">Clear history</button></p>`;
+  document.getElementById('clear').onclick = () => { localStorage.removeItem(STORAGE_KEY); location.reload(); };
+}
+
+// ------------------------------------------------------------------ case run
+async function runCase(p) {
+  const runs = loadRuns();
+  const run = {case: location.search.slice(1), params: p, startedAt: new Date().toISOString(),
+               estBytes: mib(estimateBytes(p)), events: [], result: null};
+  runs.push(run);
+  const t0 = performance.now();
+  const panel = document.getElementById('panel');
+  const log = (msg) => {
+    run.events.push(`${((performance.now() - t0) / 1000).toFixed(2)}s ${msg}`);
+    saveRuns(runs);
+    panel.innerHTML = `<h3>case: ${run.case}</h3><pre>${run.events.join('\n')}</pre><a href="?">back to index</a>`;
+    if (window.__gpuLedgerSink) window.__gpuLedgerSink({probe: run.case, msg});
+  };
+  const finish = (result) => {
+    if (run.result) return;
+    run.result = result;
+    log(`RESULT: ${result}`);
+    // Test runner (auto=1): go back right away, before anything else touches the GPU.
+    if (AUTO) setTimeout(() => location.replace(RETURN_URL), 300);
+  };
+  const ledger = (label) => {
+    if (!window.__gpuLedger) return;
+    const s = window.__gpuLedger.record(label);
+    log(`ledger ${label}: GPU ${s.totalGpuMiB} MiB in ${s.contexts.filter((c) => !c.lost).length} contexts, ` +
+        `ImageBitmaps ${s.liveImageBitmapMiB} MiB, heap ${s.wasmHeapMiB} MiB, JS ${s.jsHeapUsedMiB} MiB`);
+  };
+  window.__keep = [];
+  const CK_ATTRS = {alpha: true, depth: true, stencil: true, antialias: false, premultipliedAlpha: true,
+                    preserveDrawingBuffer: false};
+
+  log(`start, est. live texture bytes ${run.estBytes}, env ${JSON.stringify(
+      {toimg: p.toimg, present: p.present, ds: p.ds, heap: p.heap, bitmaps: p.bitmaps, fps: p.fps, delbase: p.delbase, fin: p.fin})}`);
+
+  // Source image, like an <img>/PNG decoded to an ImageBitmap in Flutter web.
+  const oc = new OffscreenCanvas(SRC_W, SRC_H);
+  const c2d = oc.getContext('2d');
+  const grad = c2d.createLinearGradient(0, 0, SRC_W, SRC_H);
+  grad.addColorStop(0, '#1d3c78'); grad.addColorStop(0.5, '#e07a2f'); grad.addColorStop(1, '#2f8f4e');
+  c2d.fillStyle = grad; c2d.fillRect(0, 0, SRC_W, SRC_H);
+  c2d.fillStyle = '#fff';
+  for (let x = 0; x < SRC_W; x += 64) c2d.fillRect(x, 0, 2, SRC_H);
+  for (let y = 0; y < SRC_H; y += 64) c2d.fillRect(0, y, SRC_W, 2);
+  const bitmap = await createImageBitmap(oc);
+  log(`ImageBitmap ${bitmap.width}x${bitmap.height} ready`);
+
+  // --- Ballast, in Flutter's creation order.
+  if (p.heap) {
+    // CanvasKit's wasm heap: committed, never shrinks.
+    const mem = new WebAssembly.Memory({initial: p.heap * 16});
+    new Uint8Array(mem.buffer).fill(1);
+    window.__keep.push(mem);
+    window.__ballastHeapBytes = mem.buffer.byteLength;
+    log(`wasm heap ballast ${p.heap} MiB committed`);
+  }
+  for (let i = 0; i < p.bitmaps; i++) window.__keep.push(await createImageBitmap(oc));
+  if (p.bitmaps) log(`${p.bitmaps} extra live ImageBitmap(s) ${SRC_W}x${SRC_H}`);
+  if (p.toimg) {
+    // Picture.toImage singleton surface: render, snapshot into a texture, read back.
+    const tc = new OffscreenCanvas(SRC_W, SRC_H);
+    tc.addEventListener('webglcontextlost', () => { log('webglcontextlost (toImage context)'); finish('CONTEXT LOST'); });
+    const tg = tc.getContext('webgl2', CK_ATTRS);
+    const atlas = tg.createTexture();
+    tg.bindTexture(tg.TEXTURE_2D, atlas);
+    tg.texStorage2D(tg.TEXTURE_2D, 1, tg.R8, 2048, 2048);
+    const snap = tg.createTexture();
+    tg.bindTexture(tg.TEXTURE_2D, snap);
+    tg.texStorage2D(tg.TEXTURE_2D, 1, tg.RGBA8, SRC_W, SRC_H);
+    const fbo = tg.createFramebuffer();
+    let pixels = new Uint8Array(SRC_W * SRC_H * 4);
+    for (let i = 0; i < p.toimg; i++) {
+      tg.bindFramebuffer(tg.FRAMEBUFFER, null);
+      tg.clearColor(i / 6, 0.5, 0.5, 1);
+      tg.clear(tg.COLOR_BUFFER_BIT | tg.DEPTH_BUFFER_BIT | tg.STENCIL_BUFFER_BIT);
+      tg.bindTexture(tg.TEXTURE_2D, snap);
+      tg.copyTexSubImage2D(tg.TEXTURE_2D, 0, 0, 0, 0, 0, SRC_W, SRC_H);  // makeImageSnapshot
+      tg.bindFramebuffer(tg.FRAMEBUFFER, fbo);
+      tg.framebufferTexture2D(tg.FRAMEBUFFER, tg.COLOR_ATTACHMENT0, tg.TEXTURE_2D, snap, 0);
+      tg.readPixels(0, 0, SRC_W, SRC_H, tg.RGBA, tg.UNSIGNED_BYTE, pixels);  // SkImage.readPixels
+      tg.bindFramebuffer(tg.FRAMEBUFFER, null);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    pixels = null;
+    window.__keep.push(tc, tg);
+    log(`toImage context ${SRC_W}x${SRC_H} (depth+stencil) after ${p.toimg} render+readback rounds, ` +
+        `getError=${tg.getError()}`);
+  }
+
+  let canvas, gl, present = () => {};
+  const w = Math.round(innerWidth * devicePixelRatio), h = Math.round(innerHeight * devicePixelRatio);
+  const ctxAttrs = p.ds ? CK_ATTRS : {antialias: false, alpha: true, premultipliedAlpha: true};
+  if (p.present === 'offscreen') {
+    // OffscreenCanvasRasterizer: draw offscreen, createImageBitmap, bitmaprenderer.
+    const display = document.createElement('canvas');
+    display.width = w; display.height = h;
+    document.body.appendChild(display);
+    const bctx = display.getContext('bitmaprenderer');
+    canvas = new OffscreenCanvas(w, h);
+    present = () => { createImageBitmap(canvas).then((bm) => bctx.transferFromImageBitmap(bm)); };
+  } else {
+    canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    document.body.appendChild(canvas);
+  }
+  canvas.addEventListener('webglcontextlost', (e) => {
+    log(`webglcontextlost statusMessage=${JSON.stringify(e.statusMessage || '')}`);
+    finish('CONTEXT LOST');
+  });
+  gl = canvas.getContext('webgl2', ctxAttrs);
+  if (!gl) { finish('NO WEBGL2'); return; }
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  log(`renderer: ${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)}`);
+
+  const errName = (e) => ({0: 'NO_ERROR', 0x500: 'INVALID_ENUM', 0x501: 'INVALID_VALUE', 0x502: 'INVALID_OPERATION',
+                           0x505: 'OUT_OF_MEMORY', 0x506: 'INVALID_FRAMEBUFFER_OPERATION', 0x9242: 'CONTEXT_LOST_WEBGL'}[e] || e);
+  const step = (label, fn) => {
+    log(`${label} ...`);
+    fn();
+    if (p.sync) log(`${label} done, getError=${errName(gl.getError())}, isContextLost=${gl.isContextLost()}`);
+  };
+  const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+  // fps=1 mimics the repro app, which repaints once a second.
+  const frameGap = async () => {
+    if (p.fps >= 60) return nextFrame();
+    await new Promise((r) => setTimeout(r, 1000 / p.fps));
+    return nextFrame();
+  };
+
+  // Full-screen quad, "cover" fit, like BoxFit.cover.
+  const vs = `#version 300 es
+    in vec2 a; out vec2 uv; uniform vec2 s;
+    void main() { uv = (a * 0.5 + 0.5 - 0.5) * s + 0.5; uv.y = 1.0 - uv.y; gl_Position = vec4(a, 0, 1); }`;
+  const fs = `#version 300 es
+    precision mediump float; in vec2 uv; uniform sampler2D t; out vec4 o;
+    void main() { o = texture(t, uv); }`;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const aLoc = gl.getAttribLocation(prog, 'a');
+  gl.enableVertexAttribArray(aLoc); gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+  const screenAspect = canvas.width / canvas.height, imgAspect = SRC_W / SRC_H;
+  gl.uniform2f(gl.getUniformLocation(prog, 's'),
+               screenAspect < imgAspect ? screenAspect / imgAspect : 1,
+               screenAspect < imgAspect ? 1 : imgAspect / screenAspect);
+  const draw = (tex) => {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    present();
+  };
+  const uploadBase = () => {
+    // Mirrors CanvasKit webgl.js makeTexture: texImage2D(TEXTURE_2D, 0, RGBA, RGBA, UNSIGNED_BYTE, src).
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+
+  // Frame 0: upload and draw without mips (what 3.41 does every frame).
+  let baseTex;
+  step(`frame 0: texImage2D level 0 ${SRC_W}x${SRC_H}`, () => { baseTex = uploadBase(); });
+  step('frame 0: draw base texture (LINEAR)', () => draw(baseTex));
+  for (let i = 0; i < (p.extra || 0); i++) {
+    const t = uploadBase();
+    step(`frame 0: extra texImage2D ${i + 1}/${p.extra} + draw`, () => draw(t));
+  }
+  ledger('frame 0 peak');
+  await frameGap();
+  await nextFrame();
+  ledger('before frame 1');
+
+  // Frame 1: the mipmapped copy that Ganesh's GrCopyBaseMipMapToView makes.
+  let shown = baseTex;
+  if (p.levels > 0) {
+    const mipTex = gl.createTexture();
+    step(`frame 1: texStorage2D levels=${p.levels} RGBA8 ${p.w}x${p.h}`, () => {
+      gl.bindTexture(gl.TEXTURE_2D, mipTex);
+      gl.texStorage2D(gl.TEXTURE_2D, p.levels, gl.RGBA8, p.w, p.h);
+    });
+    if (p.copy) {
+      const cw = Math.min(p.w, SRC_W), ch = Math.min(p.h, SRC_H);
+      step(`frame 1: copyTexSubImage2D level 0 ${cw}x${ch} from FBO(base texture)`, () => {
+        // Mirrors GrGLGpu::copySurfaceAsCopyTexSubImage.
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, baseTex, 0);
+        gl.bindTexture(gl.TEXTURE_2D, mipTex);
+        gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, cw, ch);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      });
+      if (p.fin) step('frame 1: finish() after copy', () => gl.finish());
+    }
+    if (p.gen) {
+      step('frame 1: generateMipmap', () => {
+        gl.bindTexture(gl.TEXTURE_2D, mipTex);
+        gl.generateMipmap(gl.TEXTURE_2D);
+      });
+    }
+    gl.bindTexture(gl.TEXTURE_2D, mipTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    shown = mipTex;
+    step(`frame 1: draw mipmapped copy (${p.levels > 1 ? 'LINEAR_MIPMAP_LINEAR' : 'LINEAR'})`, () => draw(shown));
+    ledger('frame 1 peak');
+    if (new URLSearchParams(location.search).get('debugLoseContext') === '1') {  // runner testing only
+      log('debug: forcing context loss');
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+    if (p.delbase) step('frame 1: deleteTexture(base)', () => gl.deleteTexture(baseTex));
+  }
+
+  // Keep presenting frames for RUN_SECONDS, like the app would.
+  const end = performance.now() + RUN_SECONDS * 1000;
+  let frames = 0;
+  const every = p.fps >= 60 ? 60 : 1;
+  while (performance.now() < end && !run.result) {
+    await frameGap();
+    if (gl.isContextLost()) break;
+    draw(shown);
+    if (p.sync && p.fps < 60) log(`frame ${frames + 2} drawn, getError=${errName(gl.getError())}, isContextLost=${gl.isContextLost()}`);
+    if (++frames % every === 0 && p.fps >= 60) log(`${frames} frames presented`);
+  }
+  if (!run.result) finish(gl.isContextLost() ? 'CONTEXT LOST' : 'PASS');
+}
+
+const p = params();
+if (p) runCase(p).catch((e) => {
+  const runs = loadRuns();
+  if (runs.length) { runs[runs.length - 1].result = 'JS ERROR: ' + e; saveRuns(runs); }
+  document.getElementById('panel').textContent = 'JS error: ' + e;
+  if (AUTO) setTimeout(() => location.replace(RETURN_URL), 300);
+});
+else renderIndex();
+</script>
+</body>
+</html>
