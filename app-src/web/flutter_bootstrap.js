@@ -42,13 +42,25 @@
     if (ledger()) ledger().record('end');
     const peak = ledger() && ledger().peak();
     if (peak) log(`ledger peak: GPU ${peak.totalGpuMiB} MiB (${describe(peak)})`);
+    if (result === 'PASS' && hiddenDuringTest) {
+      result = 'INCONCLUSIVE (the tab was hidden during the test, so Chrome paused drawing)';
+    }
     run.result = result;
     log(`RESULT: ${result}`);
     // Leave quickly after a context loss, before Flutter's recovery repeats the trigger.
     if (auto) setTimeout(() => location.replace(returnUrl), delayMs);
   }
 
-  log(`page loaded: ${location.search || '(no parameters)'}`);
+  log(`page loaded: ${location.search || '(no parameters)'}, devicePixelRatio ${devicePixelRatio}`);
+
+  // Chrome stops drawing hidden tabs, so a test that was hidden after its first
+  // frame can't tell us anything.
+  let firstDrawSeen = false;
+  let hiddenDuringTest = false;
+  document.addEventListener('visibilitychange', () => {
+    log(`tab ${document.hidden ? 'hidden' : 'visible'}`);
+    if (document.hidden && firstDrawSeen) hiddenDuringTest = true;
+  });
 
   // Log context loss on every canvas that gets a WebGL context, including CanvasKit's OffscreenCanvases.
   const glCanvases = [];
@@ -100,6 +112,8 @@
       }
     }
     if (stage === 'background 1 drawn') {
+      firstDrawSeen = true;
+      if (document.hidden) hiddenDuringTest = true;
       const s = ledger() && ledger().record('first draw');
       if (s) log(`ledger after first draw: GPU ${s.totalGpuMiB} MiB (${describe(s)})`);
       setTimeout(() => {

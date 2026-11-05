@@ -180,8 +180,16 @@ async function runCase(p) {
     panel.innerHTML = `<h3>case: ${run.case}</h3><pre>${run.events.join('\n')}</pre><a href="?">back to index</a>`;
     if (window.__gpuLedgerSink) window.__gpuLedgerSink({probe: run.case, msg});
   };
+  let hiddenDuringTest = document.hidden;
+  document.addEventListener('visibilitychange', () => {
+    log(`tab ${document.hidden ? 'hidden' : 'visible'}`);
+    if (document.hidden) hiddenDuringTest = true;
+  });
   const finish = (result) => {
     if (run.result) return;
+    if (result === 'PASS' && hiddenDuringTest) {
+      result = 'INCONCLUSIVE (the tab was hidden during the test, so Chrome paused drawing)';
+    }
     run.result = result;
     log(`RESULT: ${result}`);
     // Test runner (auto=1): go back right away, before anything else touches the GPU.

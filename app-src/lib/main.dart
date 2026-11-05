@@ -22,6 +22,8 @@ import 'package:flutter/services.dart';
 const int _width = 3840;
 const int _height = 1980;
 const int _maxLayers = 6;
+const double _maxPhysicalWidth = 1366;
+const double _maxPhysicalHeight = 768;
 
 final Map<String, String> _params = Uri.base.queryParameters;
 
@@ -104,7 +106,26 @@ class _ProbePageState extends State<ProbePage> {
         children: <Widget>[
           if (ready)
             for (final Uint8List bytes in _images)
-              Image.memory(bytes, fit: BoxFit.cover, filterQuality: _quality, gaplessPlayback: true)
+              // At most 1366x768 physical pixels (the reported Chromebook's screen),
+              // so the image is always downscaled enough for Skia to use mipmaps
+              // (it skips them at scales >= 1/sqrt(2)), whatever the device pixel ratio.
+              Align(
+                alignment: Alignment.topLeft,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: _maxPhysicalWidth / MediaQuery.devicePixelRatioOf(context),
+                    maxHeight: _maxPhysicalHeight / MediaQuery.devicePixelRatioOf(context),
+                  ),
+                  child: Image.memory(
+                    bytes,
+                    fit: BoxFit.cover,
+                    filterQuality: _quality,
+                    gaplessPlayback: true,
+                    width: double.infinity,
+                    height: double.infinity,
+                  ),
+                ),
+              )
           else
             Center(
               child: Text(

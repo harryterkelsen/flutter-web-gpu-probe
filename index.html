@@ -17,7 +17,8 @@
 <h2>Flutter web GPU memory tests</h2>
 <p>For <a href="https://github.com/flutter/flutter/issues/194283">flutter/flutter#194283</a>.
    Click <b>Run all tests</b> on the affected Chromebook, then leave the tab alone until the results appear
-   (about 6–10 minutes). The page moves from test to test on its own.</p>
+   (about 6–10 minutes). The page moves from test to test on its own.
+   <b>Keep this tab in front and the screen on</b>: Chrome pauses tabs that are hidden.</p>
 <p><b>Some tests are expected to black out the screen for a moment.</b> That's the result we're looking for:
    the page notices, records it, and continues with the next test.
    If the page itself ever disappears, reopen this page and click <b>Resume</b>.</p>
@@ -115,6 +116,13 @@ function advance(state) {
     save(state);
     render(state, `Chrome turned off WebGL for this page (probably after a GPU reset). Close this tab, ` +
                   `open the page again, and click Resume to retry "${id}".`);
+    return;
+  }
+  if (/^INCONCLUSIVE/.test(rec.result) && !(state.retried || {})[id]) {
+    state.retried = {...(state.retried || {}), [id]: true};
+    save(state);
+    render(state, `"${id}" was hidden while it ran. Keep this tab in front; retrying it in 5 s…`);
+    setTimeout(() => go(state), 5000);
     return;
   }
   const extra = STEPS[id].then ? STEPS[id].then(rec) : [];
