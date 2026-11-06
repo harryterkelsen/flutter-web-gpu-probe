@@ -77,6 +77,22 @@ const CASES = {
   env_all_nomip: ['control (no mipmapped copy) inside the full environment (3.41-like)', {levels: 0, ENV: 1}],
   env_all_nocopy:['12-level allocation, no copy, no generateMipmap, full environment', {w: 3840, h: 1980, levels: 12, copy: 0, gen: 0, ENV: 1}],
   env_all_bytes: ['no mips, 3 extra base textures, full environment', {levels: 0, extra: 3, ENV: 1}],
+  // --- Skia-faithful cases (round 2). Recorded from CanvasKit's actual GL calls:
+  //   clearlv: Skia initializes new textures on WebGL by attaching each mip level to
+  //            a framebuffer and clearing it (1 = all levels, 2 = level 0 only,
+  //            3 = levels 1+ only), after setting NEAREST filtering on the texture
+  //   sampler: sampling state lives in a sampler object (LINEAR_MIPMAP_LINEAR,
+  //            max anisotropy 1) instead of on the texture
+  //   bias:    the fragment shader samples with a -0.475 LOD bias (sharpened mips)
+  //   unit31:  the texture is created and initialized on texture unit 31
+  skia_clear:     ['flutter + Skia clears every mip level through a framebuffer', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, clearlv: 1}],
+  skia_clear0:    ['flutter + Skia-style clear of level 0 only', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, clearlv: 2}],
+  skia_clearmips: ['flutter + Skia-style clear of levels 1-11 only', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, clearlv: 3}],
+  skia_sampler:   ['flutter + sampler object (LINEAR_MIPMAP_LINEAR, anisotropy 1)', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, sampler: 1}],
+  skia_bias:      ['flutter + shader LOD bias -0.475', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, bias: 1}],
+  skia_all:       ['exact CanvasKit sequence: clear all levels + sampler + LOD bias + unit 31', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, clearlv: 1, sampler: 1, bias: 1, unit31: 1}],
+  skia_noclear:   ['exact CanvasKit sequence except the per-level clears', {w: 3840, h: 1980, levels: 12, copy: 1, gen: 1, fps: 1, delbase: 1, sampler: 1, bias: 1, unit31: 1}],
+  skia_clear_nomip: ['control: 1-level texture, Skia-style clear + copy, no mips', {w: 3840, h: 1980, levels: 1, copy: 1, gen: 0, fps: 1, delbase: 1, clearlv: 1, sampler: 1, bias: 1, unit31: 1}],
   // Plain page (no environment), but with more live bytes than Flutter's
   // measured peak (~172 MiB at the mipmapped copy, ~133 MiB with mips off).
   bytes_hi:      ['plain page, no mips, 6 extra 3840x1980 textures (~203 MiB + canvas)', {levels: 0, extra: 6}],
@@ -90,12 +106,12 @@ function params() {
   if (!name) return null;
   let base = CASES[name] ? {...CASES[name][1]} : {};
   if (base.ENV) { delete base.ENV; base = {...ENV, ...base}; }
-  for (const k of ['w', 'h', 'levels', 'copy', 'gen', 'extra', 'sync', 'toimg', 'ds', 'heap', 'bitmaps', 'fps', 'delbase', 'fin']) {
+  for (const k of ['w', 'h', 'levels', 'copy', 'gen', 'extra', 'sync', 'toimg', 'ds', 'heap', 'bitmaps', 'fps', 'delbase', 'fin', 'clearlv', 'sampler', 'bias', 'unit31']) {
     if (q.has(k)) base[k] = Number(q.get(k));
   }
   if (q.has('present')) base.present = q.get('present');
   return {name, sync: 1, extra: 0, copy: 0, gen: 0, toimg: 0, present: 'canvas', ds: 0, heap: 0,
-          bitmaps: 0, fps: 60, delbase: 0, fin: 0, ...base};
+          bitmaps: 0, fps: 60, delbase: 0, fin: 0, clearlv: 0, sampler: 0, bias: 0, unit31: 0, ...base};
 }
 
 function mib(bytes) { return (bytes / 1048576).toFixed(1) + ' MiB'; }
@@ -308,7 +324,7 @@ async function runCase(p) {
     void main() { uv = (a * 0.5 + 0.5 - 0.5) * s + 0.5; uv.y = 1.0 - uv.y; gl_Position = vec4(a, 0, 1); }`;
   const fs = `#version 300 es
     precision mediump float; in vec2 uv; uniform sampler2D t; out vec4 o;
-    void main() { o = texture(t, uv); }`;
+    void main() { o = ${p.bias ? 'texture(t, uv, -0.475)' : 'texture(t, uv)'}; }`;
   const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
   const prog = gl.createProgram();
   gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
@@ -323,7 +339,20 @@ async function runCase(p) {
   gl.uniform2f(gl.getUniformLocation(prog, 's'),
                screenAspect < imgAspect ? screenAspect / imgAspect : 1,
                screenAspect < imgAspect ? 1 : imgAspect / screenAspect);
+  // Skia keeps sampling state in sampler objects on WebGL2.
+  let mipSampler = null;
+  if (p.sampler) {
+    gl.getExtension('EXT_texture_filter_anisotropic');
+    mipSampler = gl.createSampler();
+    gl.samplerParameteri(mipSampler, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.samplerParameteri(mipSampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.samplerParameteri(mipSampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.samplerParameteri(mipSampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.samplerParameterf(mipSampler, 0x84fe /* TEXTURE_MAX_ANISOTROPY_EXT */, 1);
+  }
+  let samplerFor = null;
   const draw = (tex) => {
+    gl.bindSampler(0, tex === samplerFor ? mipSampler : null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -359,10 +388,34 @@ async function runCase(p) {
   let shown = baseTex;
   if (p.levels > 0) {
     const mipTex = gl.createTexture();
+    if (p.unit31) gl.activeTexture(gl.TEXTURE31);
     step(`frame 1: texStorage2D levels=${p.levels} RGBA8 ${p.w}x${p.h}`, () => {
       gl.bindTexture(gl.TEXTURE_2D, mipTex);
+      if (p.clearlv || p.unit31) {
+        // Skia sets these on every new texture before allocating it.
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      }
       gl.texStorage2D(gl.TEXTURE_2D, p.levels, gl.RGBA8, p.w, p.h);
     });
+    if (p.clearlv) {
+      const first = p.clearlv === 3 ? 1 : 0, last = p.clearlv === 2 ? 0 : p.levels - 1;
+      step(`frame 1: clear mip levels ${first}-${last} through a framebuffer (Skia texture init)`, () => {
+        // Mirrors GrGLGpu::createTexture with levelClearMask (fShouldInitializeTextures on WebGL).
+        const fbo = gl.createFramebuffer();
+        gl.clearColor(0, 0, 0, 0);
+        for (let level = first; level <= last; level++) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, mipTex, level);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      });
+    }
+    if (p.unit31) gl.activeTexture(gl.TEXTURE0);
     if (p.copy) {
       const cw = Math.min(p.w, SRC_W), ch = Math.min(p.h, SRC_H);
       step(`frame 1: copyTexSubImage2D level 0 ${cw}x${ch} from FBO(base texture)`, () => {
@@ -384,11 +437,17 @@ async function runCase(p) {
       });
     }
     gl.bindTexture(gl.TEXTURE_2D, mipTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (p.sampler) {
+      // Skia leaves the texture's own parameters alone; the sampler object decides.
+      if (p.levels === 1) gl.samplerParameteri(mipSampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    } else {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, p.levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
     shown = mipTex;
+    samplerFor = mipTex;
     step(`frame 1: draw mipmapped copy (${p.levels > 1 ? 'LINEAR_MIPMAP_LINEAR' : 'LINEAR'})`, () => draw(shown));
     ledger('frame 1 peak');
     if (new URLSearchParams(location.search).get('debugLoseContext') === '1') {  // runner testing only

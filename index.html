@@ -29,11 +29,13 @@
 'use strict';
 const STATE_KEY = 'gpuProbeRunner';
 const HERE = location.origin + location.pathname;
+// Round 2 is the default; ?round=1 runs the first round again.
+const ROUND = new URLSearchParams(location.search).get('round') === '1' ? 1 : 2;
 const COLLECT = new URLSearchParams(location.search).get('collect') === '1';  // local testing only
 // Local testing only: simulateLoss=<step,step> forces a WebGL context loss in those steps.
 const SIMULATE = (new URLSearchParams(location.search).get('simulateLoss') || localStorage.getItem('gpuProbeSimulate') || '').split(',');
 if (new URLSearchParams(location.search).has('simulateLoss')) localStorage.setItem('gpuProbeSimulate', SIMULATE.join(','));
-const RETURN = HERE + '?continue=1' + (COLLECT ? '&collect=1' : '');
+const RETURN = HERE + '?continue=1' + (COLLECT ? '&collect=1' : '') + (ROUND === 1 ? '&round=1' : '');
 
 // Most informative and least risky first. 'then' adds follow-up steps based on a result.
 const STEPS = {
@@ -53,9 +55,23 @@ const STEPS = {
   probe_env_all_nocopy: {kind: 'probe', case: 'env_all_nocopy', what: 'WebGL only: Flutter-like setup, 12-level allocation without the copy'},
   probe_env_all_bytes:  {kind: 'probe', case: 'env_all_bytes', what: 'WebGL only: Flutter-like setup, no mips, ~214 MiB'},
   app_medium:       {kind: 'app', q: 'quality=medium', what: 'Original scenario (expected to black out, like 3.47.5)'},
+  // Round 2: the exact GL calls CanvasKit makes, one difference at a time.
+  probe_skia_clear_nomip: {kind: 'probe', case: 'skia_clear_nomip', what: 'WebGL only: CanvasKit-style calls, no mipmaps (control)'},
+  probe_skia_all:   {kind: 'probe', case: 'skia_all', what: 'WebGL only: exact CanvasKit sequence (per-level clears + sampler + LOD bias)',
+                     then: (r) => isFail(r)
+                         ? ['probe_skia_noclear', 'probe_skia_clear', 'probe_skia_clearmips', 'probe_skia_clear0', 'probe_skia_sampler', 'probe_skia_bias']
+                         : []},
+  probe_skia_noclear:   {kind: 'probe', case: 'skia_noclear', what: 'WebGL only: exact CanvasKit sequence without the per-level clears'},
+  probe_skia_clear:     {kind: 'probe', case: 'skia_clear', what: 'WebGL only: mipmapped copy + clearing every mip level'},
+  probe_skia_clearmips: {kind: 'probe', case: 'skia_clearmips', what: 'WebGL only: mipmapped copy + clearing mip levels 1-11'},
+  probe_skia_clear0:    {kind: 'probe', case: 'skia_clear0', what: 'WebGL only: mipmapped copy + clearing level 0 only'},
+  probe_skia_sampler:   {kind: 'probe', case: 'skia_sampler', what: 'WebGL only: mipmapped copy + sampler object'},
+  probe_skia_bias:      {kind: 'probe', case: 'skia_bias', what: 'WebGL only: mipmapped copy + shader LOD bias'},
 };
-const ORDER = ['app_asset_low', 'app_shrink', 'app_low6', 'app_asset_medium',
-               'probe_env_all_nomip', 'probe_bytes_hi', 'probe_flutter_hi', 'probe_env_all', 'app_medium'];
+const ORDER = ROUND === 1
+    ? ['app_asset_low', 'app_shrink', 'app_low6', 'app_asset_medium',
+       'probe_env_all_nomip', 'probe_bytes_hi', 'probe_flutter_hi', 'probe_env_all', 'app_medium']
+    : ['app_asset_low', 'probe_skia_clear_nomip', 'probe_skia_all', 'app_asset_medium'];
 
 const isFail = (r) => !!r && /CONTEXT LOST|INTERRUPTED/.test(r.result || '');
 const load = () => { try { return JSON.parse(localStorage.getItem(STATE_KEY) || 'null'); } catch (e) { return null; } };
@@ -149,7 +165,7 @@ function finishAll(state) {
 
 function resultsJson(state) {
   return {
-    device: state.device, startedAt: state.startedAt, finishedAt: state.finishedAt || null,
+    round: ROUND, device: state.device, startedAt: state.startedAt, finishedAt: state.finishedAt || null,
     results: state.queue.filter((id) => state.results[id]).map((id) => ({
       test: id, what: STEPS[id].what, result: state.results[id].result,
       ledger: state.results[id].events.filter((e) => /ledger|mipmapped allocation|context lost|shrinking|RESULT/i.test(e)),
